@@ -4,6 +4,7 @@ use std::process::Command;
 ///
 /// This finds the parent application of the Claude process and activates it.
 /// Works with Terminal, iTerm2, Zed, VS Code, Cursor, and other applications.
+#[cfg(not(windows))]
 pub fn open_session(pid: u32, project_path: String) -> Result<(), String> {
     // Find the parent application by walking up the process tree
     let app_name = find_parent_app(pid)?;
@@ -630,6 +631,7 @@ fn get_app_cli(_app_name: &str) -> Option<String> {
 }
 
 /// Find the parent GUI application for a given process ID
+#[cfg(not(windows))]
 fn find_parent_app(pid: u32) -> Result<String, String> {
     let mut current_pid = pid;
 
@@ -862,29 +864,207 @@ fn is_jetbrains_ide(app_name: &str) -> bool {
     jetbrains_url_scheme(app_name).is_some()
 }
 
-/// Stop a session by sending SIGTERM to the process
+// ── Windows: open/focus a session's window ──────────────────────────
+
+/// Open a session by focusing its IDE/terminal window on Windows.
 ///
-/// This gracefully terminates the Claude process by sending a SIGTERM signal.
-/// SIGTERM is preferred over SIGINT as Claude Code may trap SIGINT for its own use.
+/// Editors that ship a CLI launcher (VS Code, Cursor, Windsurf) are focused by
+/// re-invoking that CLI with the project path, which reliably reuses the
+/// existing window. For everything else we walk the process tree to the owning
+/// GUI process and bring its top-level window to the foreground.
+#[cfg(windows)]
+pub fn open_session(pid: u32, project_path: String) -> Result<(), String> {
+    let tree = crate::proc::ProcessTree::capture();
+    let app = find_gui_app_windows(&tree, pid);
+
+    crate::debug_log::log_info(&format!(
+        "[open_session] Windows app: {:?}, Path: {}",
+        app, project_path
+    ));
+
+    if let Some((app_name, gui_pid)) = app {
+        // Reuse the editor window via its CLI launcher when available.
+        if let Some(cli) = vscode_family_cli(&app_name) {
+            // The CLI shims (code.cmd, cursor.cmd) must run through cmd.exe.
+            let status = Command::new("cmd")
+                .args(["/C", cli, "-r"])
+                .arg(&project_path)
+                .status();
+            match status {
+                Ok(s) if s.success() => {
+                    crate::debug_log::log_info("[open_session] CLI launch succeeded");
+                    return Ok(());
+                }
+                Ok(s) => crate::debug_log::log_warn(&format!(
+                    "[open_session] CLI launch exited with {:?}",
+                    s.code()
+                )),
+                Err(e) => {
+                    crate::debug_log::log_error(&format!("[open_session] CLI launch failed: {}", e))
+                }
+            }
+        }
+
+        // Fallback: bring the owning GUI window to the foreground.
+        activate_windows_by_pid(gui_pid);
+        return Ok(());
+    }
+
+    crate::debug_log::log_warn("[open_session] No known GUI app found in process ancestry");
+    Ok(())
+}
+
+/// Walk up the process tree from `start`, returning the first recognized GUI
+/// application as `(app_name, pid)`.
+#[cfg(windows)]
+fn find_gui_app_windows(tree: &crate::proc::ProcessTree, start: u32) -> Option<(String, u32)> {
+    let mut current = start;
+    for _ in 0..25 {
+        if let Some(name) = tree.name(current) {
+            if let Some(app) = get_app_name_windows(name) {
+                return Some((app.to_string(), current));
+            }
+        }
+        current = tree.parent(current)?;
+    }
+    None
+}
+
+/// Map a Windows process name (e.g. `Code.exe`, `idea64.exe`) to a friendly app
+/// name. Returns `None` for unrecognized processes (shells, conhost, etc.).
+#[cfg(windows)]
+fn get_app_name_windows(raw: &str) -> Option<&'static str> {
+    // Normalize: basename, strip a trailing .exe, lowercase.
+    let base = raw.rsplit(['\\', '/']).next().unwrap_or(raw);
+    let base = base
+        .strip_suffix(".exe")
+        .or_else(|| base.strip_suffix(".EXE"))
+        .unwrap_or(base);
+    let app = match base.to_lowercase().as_str() {
+        // Editors
+        "code" => "Visual Studio Code",
+        "cursor" => "Cursor",
+        "windsurf" => "Windsurf",
+        "zed" => "Zed",
+        "sublime_text" | "subl" => "Sublime Text",
+        // JetBrains (Windows launchers are usually <ide>64.exe)
+        "idea64" | "idea" => "IntelliJ IDEA",
+        "pycharm64" | "pycharm" => "PyCharm",
+        "webstorm64" | "webstorm" => "WebStorm",
+        "phpstorm64" | "phpstorm" => "PhpStorm",
+        "goland64" | "goland" => "GoLand",
+        "clion64" | "clion" => "CLion",
+        "rider64" | "rider" => "Rider",
+        "rubymine64" | "rubymine" => "RubyMine",
+        "datagrip64" | "datagrip" => "DataGrip",
+        "studio64" | "studio" => "Android Studio",
+        "rustrover64" | "rustrover" => "RustRover",
+        // Terminals
+        "windowsterminal" | "wt" => "Windows Terminal",
+        "powershell" | "pwsh" => "PowerShell",
+        "cmd" => "Command Prompt",
+        "alacritty" => "Alacritty",
+        "wezterm-gui" | "wezterm" => "WezTerm",
+        "kitty" => "kitty",
+        "hyper" => "Hyper",
+        _ => return None,
+    };
+    Some(app)
+}
+
+/// Returns the CLI launcher name for VS Code–family editors, else `None`.
+#[cfg(windows)]
+fn vscode_family_cli(app_name: &str) -> Option<&'static str> {
+    match app_name {
+        "Visual Studio Code" => Some("code"),
+        "Cursor" => Some("cursor"),
+        "Windsurf" => Some("windsurf"),
+        _ => None,
+    }
+}
+
+/// Bring the first visible top-level window owned by `pid` to the foreground,
+/// restoring it if minimized. Best-effort: does nothing if no such window
+/// exists (e.g. console-only shells hosted by a pseudoconsole).
+#[cfg(windows)]
+fn activate_windows_by_pid(pid: u32) {
+    use windows::Win32::Foundation::{BOOL, FALSE, HWND, LPARAM, TRUE};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetWindowThreadProcessId, IsIconic, IsWindowVisible, SetForegroundWindow,
+        ShowWindow, SW_RESTORE,
+    };
+
+    struct Ctx {
+        pid: u32,
+        hwnd: HWND,
+    }
+
+    extern "system" fn enum_cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        unsafe {
+            let ctx = &mut *(lparam.0 as *mut Ctx);
+            let mut wpid = 0u32;
+            GetWindowThreadProcessId(hwnd, Some(&mut wpid));
+            if wpid == ctx.pid && IsWindowVisible(hwnd).as_bool() {
+                ctx.hwnd = hwnd;
+                return FALSE; // found one — stop enumerating
+            }
+            TRUE
+        }
+    }
+
+    let mut ctx = Ctx {
+        pid,
+        hwnd: HWND::default(),
+    };
+    unsafe {
+        let _ = EnumWindows(Some(enum_cb), LPARAM(&mut ctx as *mut _ as isize));
+        if !ctx.hwnd.0.is_null() {
+            if IsIconic(ctx.hwnd).as_bool() {
+                let _ = ShowWindow(ctx.hwnd, SW_RESTORE);
+            }
+            let _ = SetForegroundWindow(ctx.hwnd);
+        }
+    }
+}
+
+/// Stop a session by gracefully terminating the process.
+///
+/// On Unix this sends SIGTERM (preferred over SIGINT, which Claude Code may trap
+/// for its own use). On Windows it uses `taskkill` without `/F`, which posts a
+/// WM_CLOSE / CTRL_C-style request for a graceful shutdown.
 pub fn stop_session(pid: u32) -> Result<(), String> {
     crate::debug_log::log_info(&format!("[stop_session] Stopping PID: {}", pid));
 
-    // First try SIGTERM (signal 15) - graceful termination
+    #[cfg(unix)]
     let output = Command::new("kill")
         .arg("-15") // SIGTERM
         .arg(pid.to_string())
         .output()
         .map_err(|e| format!("Failed to execute kill command: {}", e))?;
 
+    // `taskkill /PID <pid> /T` terminates the process and its children. Without
+    // `/F` it requests a graceful close. `/T` covers the case where Claude runs
+    // as a child of a shell wrapper.
+    #[cfg(windows)]
+    let output = Command::new("taskkill")
+        .arg("/PID")
+        .arg(pid.to_string())
+        .arg("/T")
+        .output()
+        .map_err(|e| format!("Failed to execute taskkill command: {}", e))?;
+
+    #[cfg(not(any(unix, windows)))]
+    let output: std::process::Output = return Err("Unsupported platform".to_string());
+
     if !output.status.success() {
         let error = String::from_utf8_lossy(&output.stderr);
-        crate::debug_log::log_error(&format!("[stop_session] SIGTERM failed: {}", error));
+        crate::debug_log::log_error(&format!("[stop_session] terminate failed: {}", error));
 
-        // If SIGTERM fails, the process might not exist or we don't have permission
+        // The process might not exist or we don't have permission.
         return Err(format!("Failed to stop process {}: {}", pid, error));
     }
 
-    crate::debug_log::log_info("[stop_session] SIGTERM sent successfully");
+    crate::debug_log::log_info("[stop_session] stop request sent successfully");
     Ok(())
 }
 

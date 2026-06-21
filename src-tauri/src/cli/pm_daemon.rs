@@ -4,8 +4,7 @@ use crate::cli::pm_worker::{SpawnArgs, SpawnContext, WorkerHandle};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{UnixListener, UnixStream};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 
 const DEFAULT_MAX_WORKERS: usize = 16;
@@ -29,47 +28,68 @@ fn callback_inbox_hint(worker_session_id: &str) -> String {
 
 /// Called by the CLI's `Daemon` subcommand. Starts the RPC server loop.
 pub async fn run_daemon() -> Result<(), String> {
-    // 1. Ensure directories exist
+    // Ensure directories exist
     pm_fs::ensure_dirs()?;
 
-    // 2. Get socket path and remove stale socket if it exists
-    let sock_path = pm_fs::daemon_sock_path()?;
-    if sock_path.exists() {
-        std::fs::remove_file(&sock_path)
-            .map_err(|e| format!("Failed to remove stale socket {:?}: {}", sock_path, e))?;
-    }
-
-    // 3. Bind the Unix socket BEFORE writing the pid file. `ensure_daemon`
-    //    treats a live pid file as proof that the daemon is accepting RPCs, so
-    //    the socket must be listening first — otherwise a waiter can see the
-    //    pid, dial the socket, and hit ECONNREFUSED (fix C3).
-    let listener = UnixListener::bind(&sock_path)
-        .map_err(|e| format!("Failed to bind Unix socket {:?}: {}", sock_path, e))?;
-
-    // 4. Write PID file now that the socket is listening.
-    let pid = std::process::id();
-    let pid_path = pm_fs::daemon_pid_path()?;
-    std::fs::write(&pid_path, pid.to_string())
-        .map_err(|e| format!("Failed to write PID file {:?}: {}", pid_path, e))?;
-
-    // 5. Read max_workers from env
+    // Read max_workers from env
     let max_workers: usize = std::env::var("C9WATCH_MAX_WORKERS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(DEFAULT_MAX_WORKERS);
 
+    // Shared state
+    let state = Arc::new(Mutex::new(DaemonState {
+        workers: HashMap::new(),
+    }));
+
+    #[cfg(unix)]
+    {
+        run_daemon_unix(max_workers, state).await
+    }
+    #[cfg(windows)]
+    {
+        run_daemon_windows(max_workers, state).await
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (max_workers, state);
+        Err("PM daemon is not supported on this platform".to_string())
+    }
+}
+
+/// Write the daemon PID file. Called *after* the IPC endpoint is listening so
+/// that any caller which sees the pid file will find the endpoint live (fix C3).
+fn write_pid_file() -> Result<u32, String> {
+    let pid = std::process::id();
+    let pid_path = pm_fs::daemon_pid_path()?;
+    std::fs::write(&pid_path, pid.to_string())
+        .map_err(|e| format!("Failed to write PID file {:?}: {}", pid_path, e))?;
+    Ok(pid)
+}
+
+/// Unix accept loop over a Unix-domain socket.
+#[cfg(unix)]
+async fn run_daemon_unix(
+    max_workers: usize,
+    state: Arc<Mutex<DaemonState>>,
+) -> Result<(), String> {
+    use tokio::net::UnixListener;
+
+    // Remove a stale socket if present, then bind BEFORE writing the pid file.
+    let sock_path = pm_fs::daemon_sock_path()?;
+    if sock_path.exists() {
+        std::fs::remove_file(&sock_path)
+            .map_err(|e| format!("Failed to remove stale socket {:?}: {}", sock_path, e))?;
+    }
+    let listener = UnixListener::bind(&sock_path)
+        .map_err(|e| format!("Failed to bind Unix socket {:?}: {}", sock_path, e))?;
+
+    let pid = write_pid_file()?;
     eprintln!(
         "[pm_daemon] Listening on {:?}, pid={}, max_workers={}",
         sock_path, pid, max_workers
     );
 
-    // 6. Shared state
-    let state = Arc::new(Mutex::new(DaemonState {
-        workers: HashMap::new(),
-    }));
-
-    // 7. Accept loop — interruptible by ctrl_c / SIGTERM so the daemon can
-    //    kill workers and clean up their worker dirs before exiting.
     loop {
         tokio::select! {
             accept = listener.accept() => {
@@ -86,7 +106,59 @@ pub async fn run_daemon() -> Result<(), String> {
                 }
             }
             _ = tokio::signal::ctrl_c() => {
-                eprintln!("[pm_daemon] Received ctrl_c / SIGINT, shutting down...");
+                eprintln!("[pm_daemon] Received ctrl_c, shutting down...");
+                shutdown_daemon(state).await;
+            }
+        }
+    }
+}
+
+/// Windows accept loop over a named pipe. The pipe server is single-instance at
+/// a time: we wait for a client to connect, hand the connected instance to a
+/// task, then immediately create the next instance for the following client.
+#[cfg(windows)]
+async fn run_daemon_windows(
+    max_workers: usize,
+    state: Arc<Mutex<DaemonState>>,
+) -> Result<(), String> {
+    use tokio::net::windows::named_pipe::ServerOptions;
+
+    let endpoint = pm_fs::daemon_endpoint()?;
+
+    let mut server = ServerOptions::new()
+        .first_pipe_instance(true)
+        .create(&endpoint)
+        .map_err(|e| format!("Failed to create named pipe {}: {}", endpoint, e))?;
+
+    let pid = write_pid_file()?;
+    eprintln!(
+        "[pm_daemon] Listening on {}, pid={}, max_workers={}",
+        endpoint, pid, max_workers
+    );
+
+    loop {
+        tokio::select! {
+            res = server.connect() => {
+                match res {
+                    Ok(()) => {
+                        // Take the connected instance and create the next one so
+                        // the following client never sees a closed pipe.
+                        let connected = server;
+                        server = ServerOptions::new()
+                            .create(&endpoint)
+                            .map_err(|e| format!("Failed to recreate named pipe: {}", e))?;
+                        let state_clone = Arc::clone(&state);
+                        tokio::spawn(async move {
+                            handle_connection(connected, state_clone, max_workers).await;
+                        });
+                    }
+                    Err(e) => {
+                        eprintln!("[pm_daemon] Pipe connect error: {}", e);
+                    }
+                }
+            }
+            _ = tokio::signal::ctrl_c() => {
+                eprintln!("[pm_daemon] Received ctrl_c, shutting down...");
                 shutdown_daemon(state).await;
             }
         }
@@ -95,11 +167,10 @@ pub async fn run_daemon() -> Result<(), String> {
 
 // ── Connection handler ────────────────────────────────────────────────────────
 
-async fn handle_connection(
-    stream: UnixStream,
-    state: Arc<Mutex<DaemonState>>,
-    max_workers: usize,
-) {
+async fn handle_connection<S>(stream: S, state: Arc<Mutex<DaemonState>>, max_workers: usize)
+where
+    S: AsyncRead + AsyncWrite + Send + 'static,
+{
     let (read_half, mut write_half) = tokio::io::split(stream);
     let mut reader = BufReader::new(read_half);
     let mut line = String::new();
@@ -191,10 +262,7 @@ async fn handle_connection(
     write_response(&mut write_half, &response).await;
 }
 
-async fn write_response(
-    write_half: &mut tokio::io::WriteHalf<UnixStream>,
-    value: &serde_json::Value,
-) {
+async fn write_response<W: AsyncWrite + Unpin>(write_half: &mut W, value: &serde_json::Value) {
     let mut line = match serde_json::to_string(value) {
         Ok(s) => s,
         Err(e) => {
@@ -781,17 +849,6 @@ async fn handle_inbox_read(
 
 // ── Ownership resolver ────────────────────────────────────────────────────────
 
-/// Check whether a PID is alive via `kill(pid, 0)`.
-#[cfg(unix)]
-fn is_pid_alive(pid: u32) -> bool {
-    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
-}
-
-#[cfg(not(unix))]
-fn is_pid_alive(_pid: u32) -> bool {
-    false
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkerStatus {
     OwnedByYou,
@@ -831,7 +888,7 @@ fn resolve_status(
     }
     // 3. meta.pm_pid alive and not ours → OWNED_BY_OTHER_PM
     if let Some(owner_pid) = meta.pm_pid {
-        if is_pid_alive(owner_pid) {
+        if crate::proc::process_alive(owner_pid) {
             return WorkerStatus::OwnedByOtherPm;
         }
     }
@@ -973,8 +1030,10 @@ mod tests {
 
     #[test]
     fn h5_cwd_existing_dir_succeeds() {
-        // /tmp is guaranteed to exist and be a directory on macOS/Linux.
-        let result = validate_cwd("/tmp");
+        // Use the OS temp dir, which exists and is a directory on every platform
+        // (/tmp on Unix, %TEMP% on Windows).
+        let dir = std::env::temp_dir();
+        let result = validate_cwd(&dir.to_string_lossy());
         assert!(result.is_ok(), "expected Ok, got: {:?}", result);
     }
 
@@ -1018,6 +1077,7 @@ mod tests {
     /// as the readiness signal (not the pid file), but the pid-file ordering
     /// ensures that any caller which _reads_ the pid file will find the socket
     /// already listening — no ECONNREFUSED window.
+    #[cfg(unix)]
     #[test]
     fn c3_socket_bound_before_pid_file_written() {
         use std::fs;

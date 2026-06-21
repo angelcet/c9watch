@@ -31,17 +31,8 @@ struct WorkerMetaOverlay {
     pid: Option<u64>,
 }
 
-#[cfg(unix)]
 fn pid_is_alive(pid: u32) -> bool {
-    if pid == 0 {
-        return false;
-    }
-    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
-}
-
-#[cfg(not(unix))]
-fn pid_is_alive(_pid: u32) -> bool {
-    true
+    crate::proc::process_alive(pid)
 }
 
 fn load_workers_overlay() -> Arc<HashMap<String, String>> {

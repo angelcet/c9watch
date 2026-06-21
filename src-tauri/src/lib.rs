@@ -6,6 +6,7 @@
 pub mod session;
 pub mod debug_log;
 pub mod actions;
+pub mod proc;
 
 // ── GUI-only modules ────────────────────────────────────────────────
 #[cfg(all(not(mobile), feature = "gui"))]
@@ -659,6 +660,7 @@ pub fn run() {
             get_memory_files,
             get_subagents,
             get_subagent_transcript,
+            #[cfg(feature = "cli")]
             get_session_tasks,
             save_temp_image,
             reveal_in_file_manager,

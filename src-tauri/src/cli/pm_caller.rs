@@ -33,13 +33,15 @@ pub fn detect_caller_session_id(
     None
 }
 
-/// Production entry point: walks parent PIDs via `ps` and uses `~/.claude/sessions/`.
-/// Returns None if home dir cannot be determined or no ancestor has a session file.
+/// Production entry point: walks parent PIDs via `sysinfo` and uses
+/// `~/.claude/sessions/`. Returns None if home dir cannot be determined or no
+/// ancestor has a session file.
 pub fn detect_caller_session_id_default() -> Option<String> {
     let home = dirs::home_dir()?;
     let sessions_dir = home.join(".claude").join("sessions");
     let my_pid = std::process::id();
-    detect_caller_session_id(my_pid, 8, &sessions_dir, get_parent_pid)
+    let tree = crate::proc::ProcessTree::capture();
+    detect_caller_session_id(my_pid, 8, &sessions_dir, |p| tree.parent(p))
 }
 
 /// Returns the OS PID of the Claude Code process in this caller's ancestor
@@ -67,39 +69,14 @@ pub fn detect_caller_pid(
     None
 }
 
-/// Production entry point: walks parent PIDs via `ps` and uses `~/.claude/sessions/`.
+/// Production entry point: walks parent PIDs via `sysinfo` and uses
+/// `~/.claude/sessions/`.
 pub fn detect_caller_pid_default() -> Option<u32> {
     let home = dirs::home_dir()?;
     let sessions_dir = home.join(".claude").join("sessions");
     let my_pid = std::process::id();
-    detect_caller_pid(my_pid, 8, &sessions_dir, get_parent_pid)
-}
-
-#[cfg(unix)]
-fn get_parent_pid(pid: u32) -> Option<u32> {
-    use std::process::Command;
-    let output = Command::new("ps")
-        .arg("-o")
-        .arg("ppid=")
-        .arg("-p")
-        .arg(pid.to_string())
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let ppid_str = String::from_utf8(output.stdout).ok()?;
-    let ppid: u32 = ppid_str.trim().parse().ok()?;
-    if ppid == 0 || ppid == 1 {
-        None
-    } else {
-        Some(ppid)
-    }
-}
-
-#[cfg(not(unix))]
-fn get_parent_pid(_pid: u32) -> Option<u32> {
-    None
+    let tree = crate::proc::ProcessTree::capture();
+    detect_caller_pid(my_pid, 8, &sessions_dir, |p| tree.parent(p))
 }
 
 #[cfg(test)]

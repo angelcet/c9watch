@@ -1,7 +1,4 @@
 use serde::{Deserialize, Serialize};
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
-use std::path::Path;
 use std::time::Duration;
 
 // ── Request types ─────────────────────────────────────────────────────
@@ -71,28 +68,43 @@ pub enum RpcRequest {
 /// unreachable (not running or not yet started).
 pub const DAEMON_UNREACHABLE: &str = "DAEMON_UNREACHABLE";
 
-/// Send an RPC request to the PM daemon over a Unix socket and return the
-/// JSON response value. The caller inspects `response["ok"]` to distinguish
-/// success (`true`) from error (`false` or absent).
+/// Send an RPC request to the PM daemon and return the JSON response value. The
+/// caller inspects `response["ok"]` to distinguish success (`true`) from error
+/// (`false` or absent).
 ///
-/// * `sock_path`  – path to the daemon's Unix socket
-/// * `request`    – the RPC operation to invoke
-/// * `timeout`    – read timeout; write timeout is always 5 s
+/// The transport is a Unix-domain socket on Unix and a named pipe on Windows.
+///
+/// * `endpoint` – daemon IPC endpoint from `pm_fs::daemon_endpoint()`
+/// * `request`  – the RPC operation to invoke
+/// * `timeout`  – overall read timeout; write timeout is always 5 s
 ///
 /// # Errors
 ///
-/// Returns `Err(DAEMON_UNREACHABLE)` if the socket does not exist or the
+/// Returns `Err(DAEMON_UNREACHABLE)` if the endpoint does not exist or the
 /// connection is refused. Other errors describe what went wrong (serialization,
 /// I/O, parse failures, etc.).
 pub fn rpc_call(
-    sock_path: &Path,
+    endpoint: &str,
     request: &RpcRequest,
     timeout: Duration,
 ) -> Result<serde_json::Value, String> {
-    // Connect
-    let stream = UnixStream::connect(sock_path).map_err(|_| DAEMON_UNREACHABLE.to_string())?;
+    let mut line =
+        serde_json::to_string(request).map_err(|e| format!("Failed to serialize request: {}", e))?;
+    line.push('\n');
 
-    // Set timeouts
+    let response_line = transport_roundtrip(endpoint, line, timeout)?;
+
+    serde_json::from_str::<serde_json::Value>(&response_line)
+        .map_err(|e| format!("Failed to parse daemon response: {}", e))
+}
+
+/// Connect to `endpoint`, send `line`, and read back exactly one response line.
+#[cfg(unix)]
+fn transport_roundtrip(endpoint: &str, line: String, timeout: Duration) -> Result<String, String> {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+
+    let stream = UnixStream::connect(endpoint).map_err(|_| DAEMON_UNREACHABLE.to_string())?;
     stream
         .set_write_timeout(Some(Duration::from_secs(5)))
         .map_err(|e| format!("Failed to set write timeout: {}", e))?;
@@ -100,12 +112,6 @@ pub fn rpc_call(
         .set_read_timeout(Some(timeout))
         .map_err(|e| format!("Failed to set read timeout: {}", e))?;
 
-    // Serialize request as a single JSON line
-    let mut line =
-        serde_json::to_string(request).map_err(|e| format!("Failed to serialize request: {}", e))?;
-    line.push('\n');
-
-    // Write
     let mut writer = stream
         .try_clone()
         .map_err(|e| format!("Failed to clone socket for writing: {}", e))?;
@@ -113,7 +119,6 @@ pub fn rpc_call(
         .write_all(line.as_bytes())
         .map_err(|e| format!("Failed to write request: {}", e))?;
 
-    // Read one response line
     let reader = BufReader::new(stream);
     let mut response_line = String::new();
     reader
@@ -122,10 +127,44 @@ pub fn rpc_call(
         .ok_or_else(|| "Daemon closed connection without sending a response".to_string())?
         .map_err(|e| format!("Failed to read response: {}", e))?
         .clone_into(&mut response_line);
+    Ok(response_line)
+}
 
-    // Parse response
-    serde_json::from_str::<serde_json::Value>(&response_line)
-        .map_err(|e| format!("Failed to parse daemon response: {}", e))
+/// Windows named-pipe transport. Uses a short-lived current-thread tokio runtime
+/// so the synchronous CLI can talk to the async daemon with a real read timeout.
+#[cfg(windows)]
+fn transport_roundtrip(endpoint: &str, line: String, timeout: Duration) -> Result<String, String> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::windows::named_pipe::ClientOptions;
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("Failed to build runtime: {}", e))?;
+
+    rt.block_on(async {
+        let client = ClientOptions::new()
+            .open(endpoint)
+            .map_err(|_| DAEMON_UNREACHABLE.to_string())?;
+        let (read_half, mut write_half) = tokio::io::split(client);
+
+        write_half
+            .write_all(line.as_bytes())
+            .await
+            .map_err(|e| format!("Failed to write request: {}", e))?;
+        let _ = write_half.flush().await;
+
+        let mut reader = BufReader::new(read_half);
+        let mut response_line = String::new();
+        match tokio::time::timeout(timeout, reader.read_line(&mut response_line)).await {
+            Ok(Ok(0)) => {
+                Err("Daemon closed connection without sending a response".to_string())
+            }
+            Ok(Ok(_)) => Ok(response_line),
+            Ok(Err(e)) => Err(format!("Failed to read response: {}", e)),
+            Err(_) => Err("RPC timed out waiting for daemon response".to_string()),
+        }
+    })
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────

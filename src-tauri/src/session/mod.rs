@@ -110,7 +110,7 @@ pub fn probe_claude_supports_agents_json() -> bool {
 fn probe_version_supports() -> bool {
     use std::process::Stdio;
     use wait_timeout::ChildExt;
-    let Ok(mut child) = Command::new("claude")
+    let Ok(mut child) = Command::new(crate::proc::resolve_claude())
         .args(["--version"])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -154,7 +154,7 @@ fn probe_version_supports() -> bool {
 fn probe_command_works() -> bool {
     use std::process::Stdio;
     use wait_timeout::ChildExt;
-    let Ok(mut child) = Command::new("claude")
+    let Ok(mut child) = Command::new(crate::proc::resolve_claude())
         .args(["agents", "--json"])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

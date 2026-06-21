@@ -1,15 +1,18 @@
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        Query, State,
+        ConnectInfo, Query, Request, State,
     },
     http::{header, StatusCode},
-    response::IntoResponse,
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::get,
     Json, Router,
 };
 use rust_embed::Embed;
 use serde::{Deserialize, Serialize};
+use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::broadcast;
 
@@ -26,6 +29,10 @@ pub struct WsState {
     pub auth_token: String,
     pub sessions_tx: broadcast::Sender<String>,
     pub notifications_tx: broadcast::Sender<String>,
+    /// When `false`, only loopback clients may connect (secure default). When
+    /// `true`, LAN clients are accepted too. Toggled live from Settings; shared
+    /// with the Tauri command layer so no server restart is needed.
+    pub remote_enabled: Arc<AtomicBool>,
 }
 
 // ── Protocol types ──────────────────────────────────────────────────
@@ -100,6 +107,10 @@ pub async fn start_server(state: Arc<WsState>) {
         .route("/health", get(health))
         .route("/info", get(info))
         .fallback(get(serve_static_fallback))
+        // Gate *every* route on the client's source address: when remote access
+        // is disabled, only loopback peers are served. This guards the token-less
+        // routes (/info, static assets) too, not just /ws.
+        .layer(middleware::from_fn_with_state(state.clone(), gate_remote))
         .with_state(state);
 
     // [::] accepts both IPv4 and IPv6 (localhost can resolve to ::1)
@@ -108,13 +119,48 @@ pub async fn start_server(state: Arc<WsState>) {
 
     match tokio::net::TcpListener::bind(&addr).await {
         Ok(listener) => {
-            if let Err(e) = axum::serve(listener, app).await {
+            // ConnectInfo<SocketAddr> requires the connect-info make service so
+            // the gate middleware can read each client's source address.
+            let service = app.into_make_service_with_connect_info::<SocketAddr>();
+            if let Err(e) = axum::serve(listener, service).await {
                 crate::debug_log::log_error(&format!("[ws-server] Error: {}", e));
             }
         }
         Err(e) => {
             crate::debug_log::log_error(&format!("[ws-server] Failed to bind {}: {}", addr, e));
         }
+    }
+}
+
+// ── Remote-access gate ──────────────────────────────────────────────
+
+/// Returns true if `ip` is a loopback address, normalizing IPv4-mapped IPv6
+/// peers (e.g. `::ffff:127.0.0.1`) that arise from the dual-stack `[::]` bind.
+fn is_loopback_peer(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_loopback(),
+        IpAddr::V6(v6) => {
+            v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+        }
+    }
+}
+
+/// Reject non-loopback clients while remote access is disabled. Loopback peers
+/// (the desktop app and same-machine browsers) are always allowed.
+async fn gate_remote(
+    State(state): State<Arc<WsState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    req: Request,
+    next: Next,
+) -> Response {
+    if is_loopback_peer(peer.ip()) || state.remote_enabled.load(Ordering::Relaxed) {
+        next.run(req).await
+    } else {
+        (
+            StatusCode::FORBIDDEN,
+            "Remote access is disabled. Enable it in c9watch Settings.",
+        )
+            .into_response()
     }
 }
 
@@ -300,5 +346,38 @@ async fn handle_message(msg: ClientMsg) -> ServerMsg {
             },
             Err(e) => ServerMsg::Error { message: e },
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_loopback_peer;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn ipv4_loopback_is_loopback() {
+        assert!(is_loopback_peer(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        assert!(is_loopback_peer(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 5))));
+    }
+
+    #[test]
+    fn ipv6_loopback_is_loopback() {
+        assert!(is_loopback_peer(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+    }
+
+    #[test]
+    fn ipv4_mapped_loopback_is_loopback() {
+        // Dual-stack [::] sockets surface localhost IPv4 clients as
+        // ::ffff:127.0.0.1 — these must still count as loopback.
+        let mapped = Ipv4Addr::LOCALHOST.to_ipv6_mapped();
+        assert!(is_loopback_peer(IpAddr::V6(mapped)));
+    }
+
+    #[test]
+    fn lan_addresses_are_not_loopback() {
+        assert!(!is_loopback_peer(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50))));
+        assert!(!is_loopback_peer(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
+        let mapped_lan = Ipv4Addr::new(192, 168, 1, 50).to_ipv6_mapped();
+        assert!(!is_loopback_peer(IpAddr::V6(mapped_lan)));
     }
 }

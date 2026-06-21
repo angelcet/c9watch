@@ -91,6 +91,13 @@
 		{:else if !info}
 			<div class="loading">Loading server info...</div>
 		{:else}
+			{#if !info.remoteAccess}
+				<div class="warning">
+					Remote access is off. This QR / URL only works from this Mac. Enable
+					“Allow LAN connections” in Settings to connect other devices.
+				</div>
+			{/if}
+
 			<div class="qr-container">
 				<img src={qrDataUrl} alt="QR Code" class="qr-image" />
 			</div>
@@ -270,5 +277,15 @@
 
 	.error {
 		color: var(--accent-red);
+	}
+
+	.warning {
+		font-family: var(--font-mono);
+		font-size: 11px;
+		line-height: 1.6;
+		color: var(--accent-amber);
+		border: 1px solid color-mix(in srgb, var(--accent-amber) 40%, transparent);
+		background: color-mix(in srgb, var(--accent-amber) 8%, transparent);
+		padding: var(--space-sm) var(--space-md);
 	}
 </style>

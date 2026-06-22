@@ -40,10 +40,10 @@ pub struct CliSessionSource {
 
 impl CliSessionSource {
     pub fn new() -> Self {
-        // Relies on PATH lookup at spawn time. We don't pull in `which` as a
-        // direct dep just for this — the probe already verified `claude` is on PATH.
+        // Resolve `claude` so npm's claude.cmd is found on Windows; on Unix this
+        // is the bare name, resolved via PATH at spawn time.
         Self {
-            claude_bin: PathBuf::from("claude"),
+            claude_bin: crate::proc::resolve_claude(),
             path_cache: HashMap::new(),
         }
     }

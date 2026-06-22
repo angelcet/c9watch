@@ -33,7 +33,7 @@ gui = [
     "dep:base64",
     "dep:tauri-nspanel",
 ]
-cli = ["dep:clap", "dep:regex", "dep:tokio"]
+cli = ["dep:clap", "dep:tokio", "dep:fs2"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [], optional = true }
@@ -49,6 +49,9 @@ dirs = "5.0"
 chrono = "0.4"
 libc = "0.2.180"
 uuid = { version = "1", features = ["v4"] }
+# Used by the always-compiled `session::sanitize` module, so it must be a
+# core (non-optional) dependency rather than gated behind the `cli` feature.
+regex = "1"
 
 # ── GUI-only dependencies ────────────────────────────────────────────
 tauri = { version = "2", features = ["tray-icon"], optional = true }
@@ -67,13 +70,31 @@ base64 = { version = "0.22", optional = true }
 
 # ── CLI-only dependencies ────────────────────────────────────────────
 clap = { version = "4", features = ["derive"], optional = true }
-regex = { version = "1", optional = true }
 wait-timeout = "0.2"
-
-# ── macOS GUI-only ───────────────────────────────────────────────────
-# tauri-nspanel provides NSPanel support for the popover (above fullscreen apps).
-# It depends on tauri, so it must be optional and gated behind the gui feature.
-tauri-nspanel = { git = "https://github.com/ahkohd/tauri-nspanel", rev = "da9c9a8d4eb7f0524a2508988df1a7d9585b4904", optional = true }
+# Cross-platform advisory file locking for the PM daemon pid file (replaces the
+# Unix-only libc::flock). Used by the `cli` feature's daemon launcher.
+fs2 = { version = "0.4", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
+
+# ── macOS GUI-only ───────────────────────────────────────────────────
+# tauri-nspanel provides NSPanel support for the popover (above fullscreen apps).
+# It depends on tauri (gated behind the gui feature) and on AppKit/objc2, so it
+# only compiles on macOS. Scope it to the macOS target so the `gui` feature can
+# still build on Windows/Linux; the `dep:tauri-nspanel` activation in `gui` is a
+# no-op on non-macOS targets where this dependency does not exist.
+[target.'cfg(target_os = "macos")'.dependencies]
+tauri-nspanel = { git = "https://github.com/ahkohd/tauri-nspanel", rev = "da9c9a8d4eb7f0524a2508988df1a7d9585b4904", optional = true }
+
+# ── Windows-only ──────────────────────────────────────────────────────
+# Win32 APIs for process liveness (OpenProcess) and window activation
+# (SetForegroundWindow/ShowWindow) — the Windows equivalents of the Unix
+# `libc::kill(pid,0)` checks and the macOS AppleScript / Linux xdotool focus.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_System_Pipes",
+    "Win32_UI_WindowsAndMessaging",
+] }

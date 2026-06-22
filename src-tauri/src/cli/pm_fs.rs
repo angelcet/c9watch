@@ -27,9 +27,77 @@ pub fn c9watch_dir() -> Result<PathBuf, String> {
     Ok(home.join(".claude").join("c9watch"))
 }
 
-/// Returns `~/.claude/c9watch/daemon.sock`
+/// Returns `~/.claude/c9watch/daemon.sock` (Unix-domain socket path).
 pub fn daemon_sock_path() -> Result<PathBuf, String> {
     Ok(c9watch_dir()?.join("daemon.sock"))
+}
+
+/// Cross-platform IPC endpoint for the PM daemon.
+///
+/// * Unix: the Unix-domain socket path (string form of [`daemon_sock_path`]).
+/// * Windows: a per-user named pipe, e.g. `\\.\pipe\c9watch-daemon-<user>`.
+pub fn daemon_endpoint() -> Result<String, String> {
+    #[cfg(unix)]
+    {
+        Ok(daemon_sock_path()?.to_string_lossy().to_string())
+    }
+    #[cfg(windows)]
+    {
+        let user = std::env::var("USERNAME").unwrap_or_default();
+        let user: String = user.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+        let user = if user.is_empty() {
+            "default".to_string()
+        } else {
+            user
+        };
+        Ok(format!(r"\\.\pipe\c9watch-daemon-{}", user))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        Err("unsupported platform".to_string())
+    }
+}
+
+/// Whether the daemon's IPC endpoint is live and accepting connections.
+///
+/// Used as the readiness signal while waiting for a freshly spawned daemon.
+/// * Unix: the socket file exists (it appears once `bind` succeeds).
+/// * Windows: a named-pipe instance is available or busy (i.e. the pipe exists).
+pub fn daemon_ready() -> bool {
+    #[cfg(unix)]
+    {
+        daemon_sock_path().map(|p| p.exists()).unwrap_or(false)
+    }
+    #[cfg(windows)]
+    {
+        windows_pipe_ready()
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        false
+    }
+}
+
+#[cfg(windows)]
+fn windows_pipe_ready() -> bool {
+    use windows::core::HSTRING;
+    use windows::Win32::Foundation::{GetLastError, ERROR_SEM_TIMEOUT};
+    use windows::Win32::System::Pipes::WaitNamedPipeW;
+
+    let name = match daemon_endpoint() {
+        Ok(n) => n,
+        Err(_) => return false,
+    };
+    let wide = HSTRING::from(name);
+    unsafe {
+        // Timeout 0: return immediately. Success => an instance is available.
+        if WaitNamedPipeW(&wide, 0).as_bool() {
+            return true;
+        }
+        // ERROR_SEM_TIMEOUT means the pipe exists but all instances are busy —
+        // the daemon is still up. Any other error (e.g. FILE_NOT_FOUND) => down.
+        GetLastError() == ERROR_SEM_TIMEOUT
+    }
 }
 
 /// Returns `~/.claude/c9watch/daemon.pid`

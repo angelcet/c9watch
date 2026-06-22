@@ -79,8 +79,8 @@ impl WorkerHandle {
         args: SpawnArgs,
         ctx: SpawnContext,
     ) -> Result<Self, String> {
-        // Build the command
-        let mut cmd = Command::new("claude");
+        // Build the command (resolve `claude` so npm's claude.cmd works on Windows)
+        let mut cmd = Command::new(crate::proc::resolve_claude());
         cmd.arg("-p")
             .arg("--input-format=stream-json")
             .arg("--output-format=stream-json")

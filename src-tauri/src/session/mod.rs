@@ -9,6 +9,7 @@ pub use custom_names::{CustomNames, CustomTitles};
 pub use detector::LegacySessionSource;
 pub mod detector_cli;
 pub use detector_cli::CliSessionSource;
+pub mod merged;
 pub mod state;
 pub use state::DetectorState;
 pub use source::{CliActivity, DetectedSession, DetectionDiagnostics, SessionKind, SessionSource};
@@ -110,7 +111,7 @@ pub fn probe_claude_supports_agents_json() -> bool {
 fn probe_version_supports() -> bool {
     use std::process::Stdio;
     use wait_timeout::ChildExt;
-    let Ok(mut child) = Command::new("claude")
+    let Ok(mut child) = Command::new(crate::proc::resolve_claude())
         .args(["--version"])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -154,7 +155,7 @@ fn probe_version_supports() -> bool {
 fn probe_command_works() -> bool {
     use std::process::Stdio;
     use wait_timeout::ChildExt;
-    let Ok(mut child) = Command::new("claude")
+    let Ok(mut child) = Command::new(crate::proc::resolve_claude())
         .args(["agents", "--json"])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -196,16 +197,14 @@ fn probe_command_works() -> bool {
 pub fn create_session_source() -> Box<dyn SessionSource> {
     use crate::session::detector::LegacySessionSource;
     use crate::session::detector_cli::CliSessionSource;
+    use crate::session::merged::MergedSessionSource;
     match mode_from_env() {
         BackendMode::ForceCli => Box::new(CliSessionSource::new()),
         BackendMode::ForceLegacy => Box::new(LegacySessionSource::new().expect("legacy ctor")),
-        BackendMode::Auto => {
-            if probe_claude_supports_agents_json() {
-                Box::new(CliSessionSource::new())
-            } else {
-                Box::new(LegacySessionSource::new().expect("legacy ctor"))
-            }
-        }
+        // Auto runs both backends and merges. The CLI backend self-degrades
+        // (returns an error that the merge ignores) on `claude` builds without
+        // `agents --json`, so no version probe is needed up front.
+        BackendMode::Auto => Box::new(MergedSessionSource::new()),
     }
 }
 

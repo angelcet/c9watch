@@ -597,13 +597,14 @@ fn cmd_stop(target: &str, pretty: bool) -> Result<(), String> {
 /// can't be any workers to match against, so PID-based stop is safe.
 fn try_resolve_worker(target: &str) -> Option<String> {
     use std::time::Duration;
-    let sock_path = pm_fs::daemon_sock_path().ok()?;
-    if !sock_path.exists() {
+    // Never start the daemon here — if it isn't up, there are no workers.
+    if !pm_fs::daemon_ready() {
         return None;
     }
+    let endpoint = pm_fs::daemon_endpoint().ok()?;
     let request = pm_rpc::RpcRequest::List;
     let response =
-        pm_rpc::rpc_call(&sock_path, &request, Duration::from_secs(2)).ok()?;
+        pm_rpc::rpc_call(&endpoint, &request, Duration::from_secs(2)).ok()?;
     let workers = response.get("workers").and_then(|w| w.as_array())?;
     let ids: Vec<String> = workers
         .iter()

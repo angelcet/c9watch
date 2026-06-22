@@ -11,16 +11,16 @@ use std::time::Duration;
 /// An exclusive advisory flock on `daemon.pid` serializes concurrent callers
 /// so that only one process ever forks the daemon.
 pub fn ensure_daemon() -> Result<(), String> {
-    use std::os::unix::io::AsRawFd;
+    use fs2::FileExt;
 
     // Ensure directories exist before opening the pid file
     pm_fs::ensure_dirs()?;
 
     let pid_path = pm_fs::daemon_pid_path()?;
-    let sock_path = pm_fs::daemon_sock_path()?;
 
     // Open (or create) the pid file and take an exclusive advisory lock.
     // This serializes concurrent `c9watch spawn` calls so only one ever forks.
+    // `fs2` maps to flock on Unix and LockFileEx on Windows.
     let lock_file = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
@@ -28,16 +28,13 @@ pub fn ensure_daemon() -> Result<(), String> {
         .open(&pid_path)
         .map_err(|e| format!("Failed to open daemon.pid for locking: {}", e))?;
 
-    let fd = lock_file.as_raw_fd();
-    let lock_result = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
-
-    if lock_result != 0 {
+    if lock_file.try_lock_exclusive().is_err() {
         // Another process holds the lock — it is starting the daemon.
-        // Wait up to 3 s for the socket to appear, then return.
+        // Wait up to 3 s for the endpoint to appear, then return.
         drop(lock_file);
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
         while std::time::Instant::now() < deadline {
-            if sock_path.exists() {
+            if pm_fs::daemon_ready() {
                 return Ok(());
             }
             std::thread::sleep(Duration::from_millis(100));
@@ -48,16 +45,17 @@ pub fn ensure_daemon() -> Result<(), String> {
     // We hold the exclusive lock. Check if a healthy daemon is already running.
     if pid_path.exists() {
         if let Ok(content) = std::fs::read_to_string(&pid_path) {
-            if let Ok(pid) = content.trim().parse::<libc::pid_t>() {
-                let alive = unsafe { libc::kill(pid, 0) } == 0;
-                if alive && sock_path.exists() {
+            if let Ok(pid) = content.trim().parse::<u32>() {
+                if crate::proc::process_alive(pid) && pm_fs::daemon_ready() {
                     // Daemon is running — release lock and return
                     return Ok(());
                 }
             }
         }
-        // Stale PID file — clean up
-        let _ = std::fs::remove_file(&sock_path);
+        // Stale daemon — clean up the Unix socket file (no-op on Windows).
+        if let Ok(sock_path) = pm_fs::daemon_sock_path() {
+            let _ = std::fs::remove_file(&sock_path);
+        }
     }
 
     // Get current executable path
@@ -85,30 +83,27 @@ pub fn ensure_daemon() -> Result<(), String> {
         .spawn()
         .map_err(|e| format!("Failed to spawn daemon process: {}", e))?;
 
-    // Wait up to 3 seconds for the socket to appear.
-    // The flock is released when `lock_file` drops at the end of this scope,
+    // Wait up to 3 seconds for the endpoint to come up.
+    // The lock is released when `lock_file` drops at the end of this scope,
     // which happens after we return — that's fine because by then the daemon
-    // has written its own PID and the socket exists, so other callers will
+    // has written its own PID and the endpoint is live, so other callers will
     // take the fast path above.
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
     while std::time::Instant::now() < deadline {
-        if sock_path.exists() {
+        if pm_fs::daemon_ready() {
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(100));
     }
 
-    Err(format!(
-        "Daemon did not start within 3 seconds (socket {:?} never appeared)",
-        sock_path
-    ))
+    Err("Daemon did not start within 3 seconds (endpoint never came up)".to_string())
 }
 
 // ── RPC helper ────────────────────────────────────────────────────────
 
 fn daemon_rpc(request: &RpcRequest, timeout: Duration) -> Result<serde_json::Value, String> {
-    let sock_path = pm_fs::daemon_sock_path()?;
-    let response = pm_rpc::rpc_call(&sock_path, request, timeout)?;
+    let endpoint = pm_fs::daemon_endpoint()?;
+    let response = pm_rpc::rpc_call(&endpoint, request, timeout)?;
 
     // If the daemon returned ok:false, print the error JSON and exit 1
     if response.get("ok").and_then(|v| v.as_bool()) == Some(false) {

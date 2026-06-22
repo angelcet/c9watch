@@ -57,16 +57,11 @@ impl DetectorState {
     }
 
     pub fn recheck_and_maybe_swap(&mut self) {
-        if self.mode != BackendMode::Auto {
-            return;
-        }
-        let supports_cli = super::probe_claude_supports_agents_json();
-        let want = if supports_cli { "cli" } else { "legacy" };
-        if self.source.backend_name() != want {
-            self.source = create_session_source();
-            self.consecutive_failures = 0;
-            self.telemetry_counter.fetch_add(1, Ordering::Relaxed);
-        }
+        // Auto mode now uses the merged backend, which runs both the CLI and
+        // legacy sources every cycle — there is nothing to swap, so avoid the
+        // previous cli/legacy flip (which caused sessions to appear/disappear
+        // when the `claude agents --json` probe was flaky). Force modes never
+        // swap either.
     }
 
     pub fn backend_name(&self) -> &'static str {

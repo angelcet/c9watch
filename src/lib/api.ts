@@ -83,10 +83,21 @@ export interface ServerInfo {
 	port: number;
 	localIp: string;
 	wsUrl: string;
+	remoteAccess: boolean;
 }
 
 export async function getServerInfo(): Promise<ServerInfo> {
 	return await invoke<ServerInfo>('get_server_info');
+}
+
+/** Whether LAN clients are currently allowed to connect (desktop/Tauri only). */
+export async function getRemoteAccess(): Promise<boolean> {
+	return await invoke<boolean>('get_remote_access');
+}
+
+/** Enable or disable LAN access for the embedded server (desktop/Tauri only). */
+export async function setRemoteAccess(enabled: boolean): Promise<void> {
+	await invoke('set_remote_access', { enabled });
 }
 
 /**

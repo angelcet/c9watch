@@ -4,6 +4,7 @@
 	import DOMPurify from 'dompurify';
 	import { openUrl } from '@tauri-apps/plugin-opener';
 	import { isTauri } from '$lib/ws';
+	import { getRemoteAccess, setRemoteAccess } from '$lib/api';
 	import {
 		currentVersion,
 		updateAvailable,
@@ -21,6 +22,10 @@
 	let checking = $state(false);
 	let justChecked = $state(false);
 
+	let remoteAccess = $state(false);
+	let remoteBusy = $state(false);
+	let remoteError = $state('');
+
 	let version = $derived($currentVersion);
 	let update = $derived($updateAvailable);
 	let dlState = $derived($downloadState);
@@ -31,7 +36,27 @@
 
 	onMount(() => {
 		if (update) fetchReleaseNotes();
+		if (isTauri()) {
+			getRemoteAccess()
+				.then((v) => (remoteAccess = v))
+				.catch((err) => console.error('[settings] getRemoteAccess failed:', err));
+		}
 	});
+
+	async function toggleRemoteAccess() {
+		if (remoteBusy) return;
+		const next = !remoteAccess;
+		remoteBusy = true;
+		remoteError = '';
+		try {
+			await setRemoteAccess(next);
+			remoteAccess = next;
+		} catch (e) {
+			remoteError = e instanceof Error ? e.message : 'Failed to update setting';
+		} finally {
+			remoteBusy = false;
+		}
+	}
 
 	$effect(() => {
 		if (update) fetchReleaseNotes();
@@ -97,7 +122,38 @@
 			</div>
 		</div>
 
-		<div class="group" in:flyIn|global={{ index: 2, duration: 350, stride: 25 }}>
+		{#if isTauri()}
+			<div class="group" in:flyIn|global={{ index: 2, duration: 350, stride: 25 }}>
+				<div class="group-title group-title--lg">Remote access</div>
+				<div class="group-body">
+					<div class="toggle-line">
+						<div class="toggle-text">
+							<span class="toggle-label">Allow LAN connections</span>
+							<span class="toggle-desc">
+								When off, only this Mac can connect. When on, devices on your
+								local network can connect with the token (Connect Mobile).
+							</span>
+						</div>
+						<button
+							class="switch"
+							class:on={remoteAccess}
+							role="switch"
+							aria-checked={remoteAccess}
+							aria-label="Allow LAN connections"
+							disabled={remoteBusy}
+							onclick={toggleRemoteAccess}
+						>
+							<span class="switch-knob"></span>
+						</button>
+					</div>
+					{#if remoteError}
+						<div class="state-line state-line--err">{remoteError}</div>
+					{/if}
+				</div>
+			</div>
+		{/if}
+
+		<div class="group" in:flyIn|global={{ index: 3, duration: 350, stride: 25 }}>
 			<div class="group-title group-title--lg">Updates</div>
 			<div class="group-body">
 				<div class="status-line">
@@ -157,7 +213,7 @@
 		</div>
 
 		{#if update}
-			<div class="group" in:flyIn|global={{ index: 3, duration: 350, stride: 25 }}>
+			<div class="group" in:flyIn|global={{ index: 4, duration: 350, stride: 25 }}>
 				<div class="group-title">Release notes · {update.version}</div>
 				<div class="notes-surface">
 					{#if notesLoading}
@@ -503,5 +559,73 @@
 	@keyframes pulse {
 		0%, 100% { opacity: 0.5; }
 		50% { opacity: 1; }
+	}
+
+	.toggle-line {
+		display: flex;
+		align-items: flex-start;
+		gap: var(--space-md);
+	}
+
+	.toggle-text {
+		display: flex;
+		flex-direction: column;
+		gap: var(--space-xs);
+		flex: 1;
+		min-width: 0;
+	}
+
+	.toggle-label {
+		font-family: var(--font-mono);
+		font-size: 13px;
+		color: var(--text-primary);
+		letter-spacing: 0.02em;
+	}
+
+	.toggle-desc {
+		font-family: var(--font-mono);
+		font-size: 11px;
+		color: var(--text-muted);
+		line-height: 1.5;
+	}
+
+	.switch {
+		position: relative;
+		flex-shrink: 0;
+		width: 40px;
+		height: 22px;
+		border-radius: 999px;
+		border: 1px solid var(--border-default);
+		background: var(--bg-base);
+		cursor: pointer;
+		transition: all var(--transition-fast);
+		margin-top: 2px;
+	}
+
+	.switch.on {
+		background: color-mix(in srgb, var(--accent-green) 30%, transparent);
+		border-color: color-mix(in srgb, var(--accent-green) 60%, transparent);
+	}
+
+	.switch:disabled {
+		opacity: 0.5;
+		cursor: not-allowed;
+	}
+
+	.switch-knob {
+		position: absolute;
+		top: 50%;
+		left: 2px;
+		transform: translateY(-50%);
+		width: 16px;
+		height: 16px;
+		border-radius: 50%;
+		background: var(--text-secondary);
+		transition: all var(--transition-fast);
+	}
+
+	.switch.on .switch-knob {
+		left: calc(100% - 18px);
+		background: var(--accent-green);
 	}
 </style>

@@ -6,12 +6,15 @@
 pub mod session;
 pub mod debug_log;
 pub mod actions;
+pub mod proc;
 
 // ── GUI-only modules ────────────────────────────────────────────────
 #[cfg(all(not(mobile), feature = "gui"))]
 pub mod auth;
 #[cfg(all(not(mobile), feature = "gui"))]
 pub mod polling;
+#[cfg(all(not(mobile), feature = "gui"))]
+pub mod settings;
 #[cfg(all(not(mobile), feature = "gui"))]
 pub mod web_server;
 
@@ -340,17 +343,54 @@ pub struct ServerInfo {
     pub port: u16,
     pub local_ip: String,
     pub ws_url: String,
+    /// Whether LAN clients are currently allowed to connect. When false, the
+    /// QR / URL only work from the local machine.
+    pub remote_access: bool,
 }
+
+/// Shared toggle for LAN access, also held by the running web server so changes
+/// take effect without a restart.
+#[cfg(all(not(mobile), feature = "gui"))]
+struct RemoteAccessState(Arc<std::sync::atomic::AtomicBool>);
 
 #[cfg(all(not(mobile), feature = "gui"))]
 #[tauri::command]
-async fn get_server_info(info: tauri::State<'_, ServerInfo>) -> Result<ServerInfo, String> {
+async fn get_server_info(
+    info: tauri::State<'_, ServerInfo>,
+    remote: tauri::State<'_, RemoteAccessState>,
+) -> Result<ServerInfo, String> {
     Ok(ServerInfo {
         token: info.token.clone(),
         port: info.port,
         local_ip: info.local_ip.clone(),
         ws_url: info.ws_url.clone(),
+        remote_access: remote.0.load(std::sync::atomic::Ordering::Relaxed),
     })
+}
+
+#[cfg(all(not(mobile), feature = "gui"))]
+#[tauri::command]
+async fn get_remote_access(remote: tauri::State<'_, RemoteAccessState>) -> Result<bool, String> {
+    Ok(remote.0.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+#[cfg(all(not(mobile), feature = "gui"))]
+#[tauri::command]
+async fn set_remote_access(
+    enabled: bool,
+    remote: tauri::State<'_, RemoteAccessState>,
+) -> Result<(), String> {
+    remote
+        .0
+        .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    let mut s = settings::Settings::load();
+    s.remote_access = enabled;
+    s.save()?;
+    debug_log::log_info(&format!(
+        "[settings] remote_access set to {}",
+        enabled
+    ));
+    Ok(())
 }
 
 #[cfg(all(not(mobile), feature = "gui"))]
@@ -401,12 +441,24 @@ pub fn run() {
             let local_ip = auth::get_local_ip();
             let port = web_server::WS_PORT;
 
+            // Secure by default: LAN access stays off until the user enables it
+            // in Settings. The flag is shared (Arc) between the web server's
+            // request gate and the Tauri command layer for live toggling.
+            let remote_access = settings::Settings::load().remote_access;
+            let remote_enabled = Arc::new(std::sync::atomic::AtomicBool::new(remote_access));
+
             let ws_url = format!("ws://{}:{}/ws?token={}", local_ip, port, token);
             let http_url = format!("http://{}:{}/?token={}", local_ip, port, token);
 
-            debug_log::log_info(&format!("Mobile connection ready — URL: {}", http_url));
-            qr2term::print_qr(&http_url).ok();
-            eprintln!();
+            if remote_access {
+                debug_log::log_info(&format!("Mobile connection ready — URL: {}", http_url));
+                qr2term::print_qr(&http_url).ok();
+                eprintln!();
+            } else {
+                debug_log::log_info(
+                    "Remote (LAN) access disabled — enable it in Settings to connect from other devices.",
+                );
+            }
 
             let (sessions_tx, _rx) = tokio::sync::broadcast::channel::<String>(16);
             let (notifications_tx, _nrx) = tokio::sync::broadcast::channel::<String>(16);
@@ -416,13 +468,16 @@ pub fn run() {
                 port,
                 local_ip: local_ip.clone(),
                 ws_url,
+                remote_access,
             };
             app.manage(server_info);
+            app.manage(RemoteAccessState(remote_enabled.clone()));
 
             let ws_state = Arc::new(web_server::WsState {
                 auth_token: token,
                 sessions_tx: sessions_tx.clone(),
                 notifications_tx: notifications_tx.clone(),
+                remote_enabled,
             });
             tauri::async_runtime::spawn(web_server::start_server(ws_state));
 
@@ -605,6 +660,7 @@ pub fn run() {
             get_memory_files,
             get_subagents,
             get_subagent_transcript,
+            #[cfg(feature = "cli")]
             get_session_tasks,
             save_temp_image,
             reveal_in_file_manager,
@@ -614,6 +670,8 @@ pub fn run() {
             get_terminal_title,
             show_main_window,
             get_server_info,
+            get_remote_access,
+            set_remote_access,
             get_debug_logs
         ]);
 

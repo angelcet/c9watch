@@ -167,11 +167,30 @@ impl LegacySessionSource {
         let mut sorted_processes: Vec<&ClaudeProcess> = processes.iter().collect();
         sorted_processes.sort_by(|a, b| b.start_time.cmp(&a.start_time));
 
+        let debug_detect = std::env::var("C9WATCH_DEBUG_DETECT").is_ok();
+
         for proc in sorted_processes {
             let proc_cwd = match &proc.cwd {
                 Some(cwd) => cwd,
-                None => continue, // Skip processes without cwd
+                None => {
+                    if debug_detect {
+                        eprintln!("[detect] pid={} cwd=<none>", proc.pid);
+                    }
+                    continue; // Skip processes without cwd
+                }
             };
+
+            if debug_detect {
+                let enc = encode_path_for_matching(&proc_cwd.to_string_lossy());
+                eprintln!(
+                    "[detect] pid={} start={} cwd={:?} encoded={} has_pid_json={}",
+                    proc.pid,
+                    proc.start_time,
+                    proc_cwd,
+                    enc,
+                    self.read_session_metadata(proc.pid).is_some()
+                );
+            }
 
             // Primary: try to resolve session ID from ~/.claude/sessions/<pid>.json
             // This file is the authoritative source and is updated after /clear,
@@ -256,6 +275,14 @@ impl LegacySessionSource {
                         && path_matches(project_dir, project_path, *has_reliable_path)
                 },
             );
+
+            if debug_detect {
+                eprintln!(
+                    "[detect] pid={} fallback_match={:?}",
+                    proc.pid,
+                    matching_session.map(|(_, p, _, _, _, _)| p.file_stem().and_then(|s| s.to_str()))
+                );
+            }
 
             if let Some((_, path, project_dir, _, project_name, _)) = matching_session {
                 if let Some(session_id) = path
@@ -420,7 +447,13 @@ impl SessionSource for LegacySessionSource {
 /// Encodes a path the same way Claude Code does for its project directory names:
 /// every non-alphanumeric character is replaced with a dash.
 pub(crate) fn encode_path_for_matching(path: &str) -> String {
-    path.chars()
+    // Strip trailing path separators before encoding. On Windows, sysinfo
+    // returns a process cwd with a trailing backslash (e.g. `C:\proj\`), which
+    // would otherwise encode to a trailing `-` and fail to match Claude's
+    // project directory name (which has no trailing separator).
+    let trimmed = path.trim_end_matches(['/', '\\']);
+    trimmed
+        .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect()
 }
@@ -519,6 +552,25 @@ mod tests {
         assert_eq!(
             encode_path_for_matching("/Users/Name/project.v2"),
             "-Users-Name-project-v2"
+        );
+    }
+
+    #[test]
+    fn test_encode_path_trims_trailing_separators() {
+        // sysinfo returns Windows cwds with a trailing backslash; the encoded
+        // form must not gain a trailing '-' or it won't match the project dir.
+        assert_eq!(
+            encode_path_for_matching(r"C:\D\git\c9watch\"),
+            "C--D-git-c9watch"
+        );
+        assert_eq!(
+            encode_path_for_matching(r"C:\D\git\c9watch"),
+            "C--D-git-c9watch"
+        );
+        // Trailing forward slashes are trimmed too.
+        assert_eq!(
+            encode_path_for_matching("/Users/Name/proj/"),
+            "-Users-Name-proj"
         );
     }
 }
